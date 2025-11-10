@@ -2,14 +2,12 @@
 """
 detect_sub_region_light.py
 
-- Detect many text-like boxes in a video by sampling frames.
-- Cluster boxes only if they overlap/are close.
-- Heuristics to select subtitle-like boxes (wide, lower-half).
-- Optionally write a preview image (frame at 5s) with boxes drawn.
-- Input: local file path OR "-" to read binary from stdin (writes temp file).
-- Output: single JSON to stdout with keys:
-  { found, video_w, video_h, all_boxes, merged_boxes, selected_boxes, params }
+Updated version:
+- Improved thresholding and morphology to reduce false positives on skin highlights.
+- Cluster boxes conservatively and select subtitle-like boxes only in lower portion of frame.
+- Optionally write preview image and return JSON to stdout.
 """
+
 import sys
 import os
 import json
@@ -31,18 +29,29 @@ def bytes_to_tempfile(data: bytes, suffix=".mp4") -> str:
     f.close()
     return f.name
 
-# image processing
 def detect_text_boxes(frame_bgr: np.ndarray,
                       min_area: int = 400,
                       morph_w: int = 9,
                       morph_h: int = 3) -> List[Tuple[int,int,int,int]]:
+    """
+    Detect probable text-contours in a single frame (BGR).
+    Returns list of bounding boxes (x,y,w,h) in frame coordinates.
+    """
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Adaptive threshold: use MEAN to be a bit more robust on gradients/skin highlights
     th = cv2.adaptiveThreshold(gray, 255,
-                               cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY_INV, 15, 9)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_w, morph_h))
+                               cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 19, 11)
+
+    # Slight erosion first to remove tiny speckles, then close/open to join small pieces of text
+    small_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,1))
+    th = cv2.erode(th, small_kernel, iterations=1)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3,morph_w//2), max(1,morph_h//2)))
     mor = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
     mor = cv2.morphologyEx(mor, cv2.MORPH_OPEN, kernel)
+
     contours, _ = cv2.findContours(mor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
     for c in contours:
@@ -50,7 +59,7 @@ def detect_text_boxes(frame_bgr: np.ndarray,
         area = w*h
         if area < min_area:
             continue
-        if w < 20 or h < 6:
+        if w < 16 or h < 6:
             continue
         boxes.append((int(x), int(y), int(w), int(h)))
     return boxes
@@ -101,8 +110,10 @@ def sample_and_detect(path: str,
                 new_w = downscale_width
                 new_h = max(1, int(round(roi.shape[0] * scale)))
                 roi_small = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                boxes_small = detect_text_boxes(roi_small, min_area=max(200, int(min_area * scale * scale)),
-                                                morph_w=max(3, int(morph_w*scale)), morph_h=max(1, morph_h))
+                boxes_small = detect_text_boxes(roi_small,
+                                                min_area=max(200, int(min_area * scale * scale)),
+                                                morph_w=max(3, int(morph_w*scale)),
+                                                morph_h=max(1, int(morph_h*scale)))
                 sx = 1.0 / scale
                 boxes_full = scale_boxes(boxes_small, sx, sx)
             else:
@@ -164,8 +175,8 @@ def cluster_boxes(boxes: List[Tuple[int,int,int,int]], img_w:int, img_h:int,
 def is_sub_like(box, W, H):
     x,y,w,h = box
     ar = w / (h + 1e-6)
-    # heuristics: wide and not too tall, and often in lower half
-    return (ar > 2.2 or w > W*0.45) and (y > H*0.2)
+    # Heuristic: subtitles are wide, in lower area, not too tall, and not hugging top/mid face
+    return (ar > 2.2 or w > W*0.45) and (y > H*0.45) and (y + h < H * 0.95)
 
 def clamp_box(box, W, H, pad=12):
     x,y,w,h = box
@@ -183,11 +194,10 @@ def write_preview_frame(path: str, merged, selected, out_preview: str = None):
         cap.release()
         if not ret:
             return None
-        # draw merged (red) and selected (green)
         for (x,y,w,h) in merged:
-            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,0,255), 4)  # red
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,0,255), 4)
         for (x,y,w,h) in selected:
-            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 4)  # green
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 4)
         if not out_preview:
             p = Path(path).with_suffix(".preview.jpg")
             out_preview = str(p)
@@ -235,11 +245,11 @@ def main():
                                             morph_w=morph_w,
                                             morph_h=morph_h)
 
-        # fallback full frame if nothing found
+        # fallback if nothing found: expand search_bottom_ratio
         if not boxes_all:
             boxes_all, W, H = sample_and_detect(path,
                                                 sample_rate_sec=sample_rate_sec,
-                                                max_samples=max_samples//2,
+                                                max_samples=max(10, max_samples//2),
                                                 search_bottom_ratio=1.0,
                                                 downscale_width=downscale_width,
                                                 min_area=max(200, min_area//2),
@@ -249,7 +259,6 @@ def main():
         merged = cluster_boxes(boxes_all, W, H, iou_thresh=iou_thresh, dist_ratio=dist_ratio)
         selected = [clamp_box(b, W, H, pad=12) for b in merged if is_sub_like(b, W, H)]
         if not selected and merged:
-            # fallback: pick largest merged box(s)
             merged_sorted = sorted(merged, key=lambda b: b[2]*b[3], reverse=True)
             selected = [clamp_box(merged_sorted[0], W, H, pad=12)]
 
@@ -272,14 +281,12 @@ def main():
             }
         }
 
-        # write preview if requested
         preview_path = None
         if write_preview:
             preview_path = write_preview_frame(path, merged, selected)
             if preview_path:
                 result["preview_path"] = preview_path
 
-        # output only JSON to stdout
         print(json.dumps(result, ensure_ascii=False))
     finally:
         if temp_to_delete and os.path.exists(temp_to_delete):
