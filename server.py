@@ -13,7 +13,7 @@ from typing import Optional
 app = FastAPI(title="Sub-Detector API")
 
 class DetectReq(BaseModel):
-    path: str  # public URL (recommended) or local path accessible in container
+    path: str
     sample_rate_sec: Optional[float] = None
     max_samples: Optional[int] = None
     bottom_ratio: Optional[float] = None
@@ -47,10 +47,7 @@ def detect(req: DetectReq):
             local_path = download_to_temp(p)
             cleanup_download = True
 
-        # build command
         cmd = ["python", "detect_sub_region_light.py", local_path]
-
-        # env overrides
         env = os.environ.copy()
         if req.sample_rate_sec is not None:
             env["DTS_SAMPLE_RATE_SEC"] = str(req.sample_rate_sec)
@@ -83,19 +80,17 @@ def detect(req: DetectReq):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"invalid json from detector: {e}. raw={out}")
 
-        # attach preview as base64 if exists
         preview_b64 = None
         if req.write_preview and j.get("preview_path"):
             preview_path = j.get("preview_path")
             try:
                 with open(preview_path, "rb") as f:
                     preview_b64 = base64.b64encode(f.read()).decode("ascii")
-                # optional: remove preview file
                 try:
                     Path(preview_path).unlink()
                 except:
                     pass
-            except Exception as e:
+            except Exception:
                 preview_b64 = None
 
         result = {"ok": True, "result": j}
