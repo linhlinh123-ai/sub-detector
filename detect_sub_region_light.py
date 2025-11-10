@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
-# detect_sub_region_light.py
-import sys, os, json, tempfile
-from pathlib import Path
+"""
+detect_sub_region_light.py
+
+- Detect many text-like boxes in a video by sampling frames.
+- Cluster boxes only if they overlap/are close.
+- Heuristics to select subtitle-like boxes (wide, lower-half).
+- Optionally write a preview image (frame at 5s) with boxes drawn.
+- Input: local file path OR "-" to read binary from stdin (writes temp file).
+- Output: single JSON to stdout with keys:
+  { found, video_w, video_h, all_boxes, merged_boxes, selected_boxes, params }
+"""
+import sys
+import os
+import json
+import math
+import tempfile
 import cv2
 import numpy as np
+from pathlib import Path
+from typing import List, Tuple
 
 def log(msg: str):
     sys.stderr.write(str(msg) + "\n")
@@ -16,18 +31,15 @@ def bytes_to_tempfile(data: bytes, suffix=".mp4") -> str:
     f.close()
     return f.name
 
-def union_box(boxes):
-    if not boxes:
-        return None
-    x1 = min(b[0] for b in boxes)
-    y1 = min(b[1] for b in boxes)
-    x2 = max(b[0] + b[2] for b in boxes)
-    y2 = max(b[1] + b[3] for b in boxes)
-    return (x1, y1, x2-x1, y2-y1)
-
-def detect_text_boxes(frame_bgr, min_area=400, morph_w=15, morph_h=3):
+# image processing
+def detect_text_boxes(frame_bgr: np.ndarray,
+                      min_area: int = 400,
+                      morph_w: int = 9,
+                      morph_h: int = 3) -> List[Tuple[int,int,int,int]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    th = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,15,9)
+    th = cv2.adaptiveThreshold(gray, 255,
+                               cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY_INV, 15, 9)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_w, morph_h))
     mor = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
     mor = cv2.morphologyEx(mor, cv2.MORPH_OPEN, kernel)
@@ -36,76 +48,245 @@ def detect_text_boxes(frame_bgr, min_area=400, morph_w=15, morph_h=3):
     for c in contours:
         x,y,w,h = cv2.boundingRect(c)
         area = w*h
-        if area < min_area: continue
-        if w < 24 or h < 8: continue
+        if area < min_area:
+            continue
+        if w < 20 or h < 6:
+            continue
         boxes.append((int(x), int(y), int(w), int(h)))
     return boxes
 
-def sample_and_detect(path, sample_rate_sec=1.0, max_samples=60, search_bottom_ratio=0.35, downscale_width=640, min_area=400):
+def scale_boxes(boxes, sx, sy):
+    out = []
+    for (x,y,w,h) in boxes:
+        out.append((int(round(x * sx)), int(round(y * sy)),
+                    int(round(w * sx)), int(round(h * sy))))
+    return out
+
+def sample_and_detect(path: str,
+                      sample_rate_sec: float = 1.0,
+                      max_samples: int = 60,
+                      search_bottom_ratio: float = 0.35,
+                      downscale_width: int = 640,
+                      min_area: int = 400,
+                      morph_w: int = 9,
+                      morph_h: int = 3) -> Tuple[List[Tuple[int,int,int,int]], int, int]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if W == 0 or H == 0:
+        cap.release()
+        raise RuntimeError("Failed to read video dimensions")
     step = max(1, int(round(sample_rate_sec * fps)))
+
     boxes_all = []
     frame_idx = 0
     samples = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         if frame_idx % step == 0:
+            # crop bottom region optionally
             bottom_h = int(round(H * search_bottom_ratio))
-            crop_y1 = max(0, H - bottom_h)
+            crop_y1 = max(0, H - bottom_h) if search_bottom_ratio < 1.0 else 0
             roi = frame[crop_y1:H, :, :]
+
+            # downscale for speed
             if downscale_width and W > downscale_width:
                 scale = downscale_width / float(W)
                 new_w = downscale_width
                 new_h = max(1, int(round(roi.shape[0] * scale)))
                 roi_small = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                boxes_small = detect_text_boxes(roi_small, min_area=max(200, int(min_area * scale * scale)))
+                boxes_small = detect_text_boxes(roi_small, min_area=max(200, int(min_area * scale * scale)),
+                                                morph_w=max(3, int(morph_w*scale)), morph_h=max(1, morph_h))
                 sx = 1.0 / scale
-                sy = 1.0 / scale
-                boxes_full = [(int(round(x*sx)), int(round(y*sy)), int(round(w*sx)), int(round(h*sy))) for (x,y,w,h) in boxes_small]
+                boxes_full = scale_boxes(boxes_small, sx, sx)
             else:
-                boxes_full = detect_text_boxes(roi, min_area=min_area)
+                boxes_full = detect_text_boxes(roi, min_area=min_area, morph_w=morph_w, morph_h=morph_h)
+
+            # shift boxes to full frame coords
             boxes_full = [(x, y + crop_y1, w, h) for (x,y,w,h) in boxes_full]
             boxes_all.extend(boxes_full)
+
             samples += 1
             if samples >= max_samples:
                 break
         frame_idx += 1
+
     cap.release()
     return boxes_all, W, H
 
+# clustering helpers
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    if xB <= xA or yB <= yA:
+        return 0.0
+    inter = (xB - xA) * (yB - yA)
+    union = boxA[2]*boxA[3] + boxB[2]*boxB[3] - inter
+    return inter/union
+
+def center_dist(boxA, boxB):
+    ax = boxA[0] + boxA[2]/2.0
+    ay = boxA[1] + boxA[3]/2.0
+    bx = boxB[0] + boxB[2]/2.0
+    by = boxB[1] + boxB[3]/2.0
+    return math.hypot(ax-bx, ay-by)
+
+def cluster_boxes(boxes: List[Tuple[int,int,int,int]], img_w:int, img_h:int,
+                  iou_thresh=0.12, dist_ratio=0.12) -> List[Tuple[int,int,int,int]]:
+    if not boxes:
+        return []
+    diag = math.hypot(img_w, img_h)
+    used = [False]*len(boxes)
+    merged = []
+    for i,b in enumerate(boxes):
+        if used[i]: continue
+        cluster = [b]
+        used[i]=True
+        for j in range(i+1, len(boxes)):
+            if used[j]: continue
+            if iou(b, boxes[j]) > iou_thresh or center_dist(b, boxes[j]) < dist_ratio*diag:
+                cluster.append(boxes[j]); used[j]=True
+        x1 = min([c[0] for c in cluster])
+        y1 = min([c[1] for c in cluster])
+        x2 = max([c[0]+c[2] for c in cluster])
+        y2 = max([c[1]+c[3] for c in cluster])
+        merged.append((int(x1), int(y1), int(x2-x1), int(y2-y1)))
+    return merged
+
+def is_sub_like(box, W, H):
+    x,y,w,h = box
+    ar = w / (h + 1e-6)
+    # heuristics: wide and not too tall, and often in lower half
+    return (ar > 2.2 or w > W*0.45) and (y > H*0.2)
+
 def clamp_box(box, W, H, pad=12):
     x,y,w,h = box
-    x2 = x+w
-    y2 = y+h
     x = max(0, x-pad)
     y = max(0, y-pad)
-    x2 = min(W, x2+pad)
-    y2 = min(H, y2+pad)
+    x2 = min(W, x+w+pad)
+    y2 = min(H, y+h+pad)
     return (int(x), int(y), int(x2-x), int(y2-y))
 
-def detect_from_path(path):
-    boxes, W, H = sample_and_detect(path)
-    if not boxes:
-        # fallback: try full-frame sample
-        boxes, W, H = sample_and_detect(path, search_bottom_ratio=1.0, max_samples=30)
-    if not boxes:
-        return {"found": False, "video_w": W, "video_h": H}
-    uni = union_box(boxes)
-    final = clamp_box(uni, W, H, pad=12)
-    x,y,w,h = final
-    return {"found": True, "x":x, "y":y, "w":w, "h":h, "video_w":W, "video_h":H}
+def write_preview_frame(path: str, merged, selected, out_preview: str = None):
+    try:
+        cap = cv2.VideoCapture(path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, 5000)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            return None
+        # draw merged (red) and selected (green)
+        for (x,y,w,h) in merged:
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,0,255), 4)  # red
+        for (x,y,w,h) in selected:
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 4)  # green
+        if not out_preview:
+            p = Path(path).with_suffix(".preview.jpg")
+            out_preview = str(p)
+        cv2.imwrite(out_preview, frame)
+        return out_preview
+    except Exception as e:
+        return None
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"found": False, "error": "usage: detect_sub_region_light.py <input.mp4 | ->"}))
+        sys.exit(0)
+
+    arg = sys.argv[1]
+    temp_to_delete = None
+    try:
+        if arg == "-":
+            data = sys.stdin.buffer.read()
+            if not data or len(data) < 1024:
+                print(json.dumps({"found": False, "error": "no stdin data"}))
+                return
+            temp_to_delete = bytes_to_tempfile(data, suffix=".mp4")
+            path = temp_to_delete
+        else:
+            path = arg
+
+        # params via env
+        sample_rate_sec = float(os.environ.get("DTS_SAMPLE_RATE_SEC", "1.0"))
+        max_samples = int(os.environ.get("DTS_MAX_SAMPLES", "60"))
+        search_bottom_ratio = float(os.environ.get("DTS_BOTTOM_RATIO", "0.35"))
+        downscale_width = int(os.environ.get("DTS_DOWNSCALE_WIDTH", "640"))
+        min_area = int(os.environ.get("DTS_MIN_AREA", "400"))
+        morph_w = int(os.environ.get("DTS_MORPH_W", "9"))
+        morph_h = int(os.environ.get("DTS_MORPH_H", "3"))
+        iou_thresh = float(os.environ.get("DTS_IOU_THRESH", "0.12"))
+        dist_ratio = float(os.environ.get("DTS_DIST_RATIO", "0.12"))
+        write_preview = os.environ.get("DTS_WRITE_PREVIEW", "0") == "1"
+
+        boxes_all, W, H = sample_and_detect(path,
+                                            sample_rate_sec=sample_rate_sec,
+                                            max_samples=max_samples,
+                                            search_bottom_ratio=search_bottom_ratio,
+                                            downscale_width=downscale_width,
+                                            min_area=min_area,
+                                            morph_w=morph_w,
+                                            morph_h=morph_h)
+
+        # fallback full frame if nothing found
+        if not boxes_all:
+            boxes_all, W, H = sample_and_detect(path,
+                                                sample_rate_sec=sample_rate_sec,
+                                                max_samples=max_samples//2,
+                                                search_bottom_ratio=1.0,
+                                                downscale_width=downscale_width,
+                                                min_area=max(200, min_area//2),
+                                                morph_w=morph_w,
+                                                morph_h=morph_h)
+
+        merged = cluster_boxes(boxes_all, W, H, iou_thresh=iou_thresh, dist_ratio=dist_ratio)
+        selected = [clamp_box(b, W, H, pad=12) for b in merged if is_sub_like(b, W, H)]
+        if not selected and merged:
+            # fallback: pick largest merged box(s)
+            merged_sorted = sorted(merged, key=lambda b: b[2]*b[3], reverse=True)
+            selected = [clamp_box(merged_sorted[0], W, H, pad=12)]
+
+        result = {
+            "found": bool(selected),
+            "video_w": int(W), "video_h": int(H),
+            "all_boxes": boxes_all,
+            "merged_boxes": merged,
+            "selected_boxes": selected,
+            "params": {
+                "sample_rate_sec": sample_rate_sec,
+                "max_samples": max_samples,
+                "bottom_ratio": search_bottom_ratio,
+                "downscale_width": downscale_width,
+                "min_area": min_area,
+                "morph_w": morph_w,
+                "morph_h": morph_h,
+                "iou_thresh": iou_thresh,
+                "dist_ratio": dist_ratio
+            }
+        }
+
+        # write preview if requested
+        preview_path = None
+        if write_preview:
+            preview_path = write_preview_frame(path, merged, selected)
+            if preview_path:
+                result["preview_path"] = preview_path
+
+        # output only JSON to stdout
+        print(json.dumps(result, ensure_ascii=False))
+    finally:
+        if temp_to_delete and os.path.exists(temp_to_delete):
+            try:
+                os.unlink(temp_to_delete)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(json.dumps({"found": False, "error": "usage: detect_sub_region_light.py <path>"}))
-        sys.exit(0)
-    path = sys.argv[1]
-    res = detect_from_path(path)
-    print(json.dumps(res))
+    main()
